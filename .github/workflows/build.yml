@@ -33,6 +33,8 @@ on:
         required: false
         default: false
         type: boolean
+  push:
+    branches: [main]
 
 jobs:
   build:
@@ -86,11 +88,20 @@ jobs:
         run: bash build.sh pack
 
       - name: 上传产物
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: K50-KowSU-output
           path: out/*
           if-no-files-found: error
+
+      - name: 上传构建日志（失败时也保留）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: out/build.log
+          if-no-files-found: warn
 
       - name: 输出摘要
         run: |
