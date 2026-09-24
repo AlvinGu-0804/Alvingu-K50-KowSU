@@ -1,0 +1,105 @@
+name: Build K50 GKI Kernel with KowSU
+
+on:
+  workflow_dispatch:
+    inputs:
+      ksu_ref:
+        description: 'KowSU 分支 / tag'
+        required: false
+        default: 'main'
+      kernel_compress:
+        description: '内核压缩格式（必须与原厂 boot.img 一致）'
+        required: false
+        default: 'gz'
+        type: choice
+        options:
+          - gz
+          - lz4
+          - none
+      ksu_mode:
+        description: 'KernelSU 构建方式'
+        required: false
+        default: 'y'
+        type: choice
+        options:
+          - y
+          - m
+      ztc_branch:
+        description: 'ztc1997 内核分支（留空=默认分支）'
+        required: false
+        default: ''
+      remove_abi_exports:
+        description: '移除 GKI 受保护符号导出表（厂商模块加载失败时勾选）'
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build Kernel + AnyKernel3
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    env:
+      KSU_REF: ${{ github.event.inputs.ksu_ref || 'main' }}
+      KERNEL_COMPRESS: ${{ github.event.inputs.kernel_compress || 'gz' }}
+      ENABLE_KSU: ${{ github.event.inputs.ksu_mode || 'y' }}
+      ZTC_BRANCH: ${{ github.event.inputs.ztc_branch || '' }}
+      REMOVE_ABI_EXPORTS: ${{ github.event.inputs.remove_abi_exports && '1' || '' }}
+
+    steps:
+      - name: Checkout builder
+        uses: actions/checkout@v4
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex git gnupg \
+            libelf-dev libssl-dev lzop python3 python3-setuptools \
+            rsync schedtool unzip zip zlib1g-dev repo
+          git config --global user.name  "builder"
+          git config --global user.email "builder@local"
+
+      - name: 启用 ccache
+        uses: hendrikmuhs/ccache-action@v1
+        with:
+          max-size: 2G
+          key: gki-k50-${{ env.KSU_REF }}-${{ env.KERNEL_COMPRESS }}
+
+      - name: 同步 GKI 源码树
+        run: bash build.sh sync
+
+      - name: 替换为 ztc1997 内核源码
+        run: bash build.sh replace
+
+      - name: 集成 KowSU
+        run: bash build.sh ksu
+
+      - name: 绕过 GKI 构建校验
+        run: bash build.sh patch
+
+      - name: 编译内核
+        run: bash build.sh kernel
+
+      - name: 打包 AnyKernel3
+        run: bash build.sh pack
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: K50-KowSU-output
+          path: out/*
+          if-no-files-found: error
+
+      - name: 输出摘要
+        run: |
+          echo "### 构建完成 :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- KowSU 分支: \`$KSU_REF\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 构建方式: CONFIG_KSU=\`$ENABLE_KSU\`" >> $GITHUB_STEP_SUMMARY
+          echo "- 内核压缩: \`$KERNEL_COMPRESS\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> ⚠️ 刷入前务必先 \`fastboot boot\` 临时启动验证硬件正常" >> $GITHUB_STEP_SUMMARY
