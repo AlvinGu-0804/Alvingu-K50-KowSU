@@ -33,8 +33,6 @@ on:
         required: false
         default: false
         type: boolean
-  push:
-    branches: [main]
 
 jobs:
   build:
