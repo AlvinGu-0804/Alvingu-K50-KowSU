@@ -33,8 +33,7 @@ on:
         required: false
         default: false
         type: boolean
-  push:
-    branches: [main]
+  # 注意：不要加 push 触发，否则每次提交文件都会自动跑一次 1 小时的编译
 
 jobs:
   build:
