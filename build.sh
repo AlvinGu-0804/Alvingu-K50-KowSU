@@ -167,7 +167,32 @@ EOF
     log "check_defconfig 已全部禁用"
   fi
 
-  # ---- 4.2 可选：移除 GKI 受保护符号导出表 ----
+  # ---- 4.2 剔除 LLVM 17+ 专属编译参数 ----
+  # 现象：clang r416183b(LLVM 14) 报
+  #   Unknown command line argument '-regalloc-enable-advisor=release'
+  # 该参数只是寄存器分配优化提示，去掉不影响功能与稳定性。
+  local cf
+  for cf in \
+      "$COMMON/Makefile" \
+      "$COMMON/arch/arm64/Makefile" \
+      "$COMMON/arch/arm64/Makefile.postlink" \
+      "$COMMON/build.config.common" \
+      "$COMMON/build.config.aarch64" \
+      "$COMMON/build.config.gki" ; do
+    [ -f "$cf" ] || continue
+    if grep -q 'regalloc-enable-advisor' "$cf"; then
+      log "清理 $cf 中的 -regalloc-enable-advisor"
+      sed -i -E 's/(-mllvm[[:space:]]+)?--?regalloc-enable-advisor=[A-Za-z0-9_-]+//g' "$cf"
+    fi
+  done
+  # 兜底：全树再扫一遍常见的构建脚本
+  grep -rl 'regalloc-enable-advisor' "$COMMON"/Makefile* "$COMMON"/build.config* 2>/dev/null \
+    | while read -r cf; do
+        log "清理(兜底) $cf"
+        sed -i -E 's/(-mllvm[[:space:]]+)?--?regalloc-enable-advisor=[A-Za-z0-9_-]+//g' "$cf"
+      done
+
+  # ---- 4.3 可选：移除 GKI 受保护符号导出表 ----
   if [ -n "${REMOVE_ABI_EXPORTS:-}" ]; then
     log "移除 abi_gki_protected_exports"
     rm -f "$COMMON"/android/abi_gki_protected_exports_* 2>/dev/null || true
@@ -197,17 +222,26 @@ do_kernel() {
   fi
   tail -20 "$OUTDIR/build.log"
 
+  # GKI 默认产出 Image.lz4，但 magiskboot repack 会按原厂格式自动重压，
+  # 因此优先取「未压缩的 Image」最稳妥；取不到再退回压缩版。
   local IMG=""
-  case "$KERNEL_COMPRESS" in
-    gz)   IMG=$(find "$TREE/out" -name 'Image.gz'   -not -path '*-dtb*' | head -1) ;;
-    lz4)  IMG=$(find "$TREE/out" -name 'Image.lz4'  -not -path '*-dtb*' | head -1) ;;
-    *)    IMG=$(find "$TREE/out" -name 'Image'      -not -path '*.gz' -not -path '*.lz4' -not -path '*-dtb*' | head -1) ;;
-  esac
-  [ -n "$IMG" ] || IMG=$(find "$TREE/out" -name 'Image*' -type f | head -1)
+  IMG=$(find "$TREE/out" -path '*/arch/arm64/boot/Image' -type f | head -1)
+
+  if [ -z "$IMG" ]; then
+    case "$KERNEL_COMPRESS" in
+      gz)  IMG=$(find "$TREE/out" -name 'Image.gz'  -not -path '*-dtb*' | head -1) ;;
+      lz4) IMG=$(find "$TREE/out" -name 'Image.lz4' -not -path '*-dtb*' | head -1) ;;
+    esac
+  fi
+  [ -n "$IMG" ] || IMG=$(find "$TREE/out" -path '*/arch/arm64/boot/Image*' -type f \
+                          -not -name '*.dtb*' | head -1)
   [ -n "$IMG" ] || err "未找到编译产物"
 
   cp -f "$IMG" "$OUTDIR/"
+  # 同时保留一份「未压缩内核」副本，命名 kernel，方便 magiskboot 直接替换
+  [ "$IMG" = "$TREE/out"*/arch/arm64/boot/Image ] || true
   log "内核产物: $OUTDIR/$(basename "$IMG")  ($(du -h "$IMG" | cut -f1))"
+  log "提示: magiskboot repack 会按原厂格式(gzip)自动重压，直接改名为 kernel 替换即可"
 
   # LKM 模式顺带产出 kernelsu.ko
   if [ "$ENABLE_KSU" = "m" ]; then
