@@ -177,10 +177,26 @@ EOF
 # ---------------- 5. 编译 ----------------
 do_kernel() {
   cd "$TREE"
-  log "开始编译 (LTO=thin, -j$JOBS)"
-  LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh 2>&1 | tail -40
-
   mkdir -p "$OUTDIR"
+  log "开始编译 (LTO=thin, -j$JOBS)，完整日志: out/build.log"
+
+  # 完整日志落盘 + 屏幕只留尾部，方便 CI 里无论成败都能取回
+  set +e
+  LTO=thin BUILD_CONFIG=common/build.config.gki.aarch64 build/build.sh \
+      > "$OUTDIR/build.log" 2>&1
+  local RC=$?
+  set -e
+
+  # 把真正的报错行单独抽出来，直接显示在控制台
+  if [ "$RC" -ne 0 ]; then
+    warn "编译失败 (exit $RC)。错误上下文："
+    grep -nE '(error:|Error [0-9]+|undefined reference|No such file|fatal error|Killed|modpost)' \
+        "$OUTDIR/build.log" | head -40
+    warn "完整日志已保存到 out/build.log"
+    exit $RC
+  fi
+  tail -20 "$OUTDIR/build.log"
+
   local IMG=""
   case "$KERNEL_COMPRESS" in
     gz)   IMG=$(find "$TREE/out" -name 'Image.gz'   -not -path '*-dtb*' | head -1) ;;
