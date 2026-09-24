@@ -65,8 +65,11 @@ do_replace_common() {
     git clone --depth=1 "$ZTC_REPO" "$COMMON"
   fi
 
-  # 缺什么补什么：把官方 GKI 构建配置拷回去
-  cp -f "$WORKDIR"/.gki_cfg_backup/build.config* "$COMMON/" 2>/dev/null || true
+  # 缺什么补什么：只补不覆盖（-n），保留 ztc 自己的构建配置
+  for f in "$WORKDIR"/.gki_cfg_backup/build.config*; do
+    [ -f "$f" ] || continue
+    cp -n "$f" "$COMMON/" 2>/dev/null || true
+  done
   [ -d "$COMMON/android" ] || cp -rf "$WORKDIR/.gki_cfg_backup/android" "$COMMON/" 2>/dev/null || true
 
   log "内核源码就绪: $(cd "$COMMON" && git log -1 --format='%h %s' 2>/dev/null || echo unknown)"
@@ -120,13 +123,51 @@ EOF
 do_patch_build() {
   cd "$TREE"
 
-  # check_defconfig: 改了 gki_defconfig 会触发校验失败
-  if grep -qE '^[[:space:]]*check_defconfig[[:space:]]*$' build/build.sh; then
-    log "禁用 check_defconfig"
-    sed -i -E 's/^([[:space:]]*)check_defconfig[[:space:]]*$/\1: # check_defconfig disabled/' build/build.sh
+  # ---- 4.1 彻底干掉 check_defconfig ----
+  # 三种存在形式都要覆盖：
+  #   a) build.config* 里的  POST_DEFCONFIG_CMDS="check_defconfig"
+  #   b) build.sh 里的       check_defconfig          (可带参数、可顶格)
+  #   c) build.config 中被 eval 展开的调用
+  # 做法：除「函数定义行」外，所有 check_defconfig 一律替换成 true，
+  #       这样既保留 POST_DEFCONFIG_CMDS 里的其它命令，又不破坏语法。
+
+  local f
+  # a) build.config*（common/ 下 + 树根下的都要处理）
+  for f in "$COMMON"/build.config* "$TREE"/build.config*; do
+    [ -f "$f" ] || continue
+    if grep -q 'check_defconfig' "$f"; then
+      log "清理 $f 中的 check_defconfig"
+      sed -i 's/\bcheck_defconfig\b/true/g' "$f"
+    fi
+  done
+
+  # b) build.sh：跳过函数定义行，其余替换成 true
+  if [ -f build/build.sh ] && grep -q 'check_defconfig' build/build.sh; then
+    log "清理 build/build.sh 中的 check_defconfig"
+    sed -i -E '/^[[:space:]]*(function[[:space:]]+)?check_defconfig[[:space:]]*\(\)?[[:space:]]*\{/! s/\bcheck_defconfig\b/true/g' build/build.sh
   fi
 
-  # 部分 Android 14 内核需移除受保护导出表，否则厂商模块过不了 modpost
+  # c) 兜底：BUILD_CONFIG 末尾强制清空，确保后面没人再把它塞回来
+  local BC="$COMMON/build.config.gki.aarch64"
+  if [ -f "$BC" ]; then
+    grep -q 'KOW_CUSTOM_MARKER' "$BC" || cat >> "$BC" <<'EOF'
+
+# KOW_CUSTOM_MARKER
+POST_DEFCONFIG_CMDS="${POST_DEFCONFIG_CMDS:-true}"
+CHECK_DEFCONFIG=
+EOF
+  fi
+
+  # 自检
+  if grep -rn 'check_defconfig' "$COMMON"/build.config* build/build.sh 2>/dev/null \
+     | grep -v 'true' | grep -q .; then
+    warn "仍有 check_defconfig 残留："
+    grep -rn 'check_defconfig' "$COMMON"/build.config* build/build.sh 2>/dev/null | head
+  else
+    log "check_defconfig 已全部禁用"
+  fi
+
+  # ---- 4.2 可选：移除 GKI 受保护符号导出表 ----
   if [ -n "${REMOVE_ABI_EXPORTS:-}" ]; then
     log "移除 abi_gki_protected_exports"
     rm -f "$COMMON"/android/abi_gki_protected_exports_* 2>/dev/null || true
