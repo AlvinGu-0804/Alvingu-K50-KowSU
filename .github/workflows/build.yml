@@ -51,6 +51,10 @@ on:
         required: false
         default: true
         type: boolean
+      susfs_repo:
+        description: 'SUSFS 自定义仓库（留空=依次尝试官方 GitLab 与 GitHub 镜像）'
+        required: false
+        default: ''
       susfs_branch:
         description: 'SUSFS 补丁分支，须与内核版本对应'
         required: false
@@ -82,6 +86,7 @@ jobs:
       KSU_REF: ${{ github.event.inputs.ksu_ref || 'main' }}
       ENABLE_SUSFS: ${{ github.event.inputs.enable_susfs && '1' || '0' }}
       SUSFS_BRANCH: ${{ github.event.inputs.susfs_branch || 'gki-android12-5.10' }}
+      SUSFS_REPO: ${{ github.event.inputs.susfs_repo || '' }}
       KERNEL_COMPRESS: ${{ github.event.inputs.kernel_compress || 'gz' }}
       ENABLE_KSU: ${{ github.event.inputs.ksu_mode || 'y' }}
       ZTC_BRANCH: ${{ github.event.inputs.ztc_branch || '' }}
