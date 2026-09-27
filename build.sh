@@ -35,7 +35,16 @@ ENABLE_KSU="${ENABLE_KSU:-y}"                                # y=built-in, m=LKM
 #   6.1   -> gki-android14-6.1      6.6  -> gki-android15-6.6
 ENABLE_SUSFS="${ENABLE_SUSFS:-0}"                            # 1=启用
 SUSFS_BRANCH="${SUSFS_BRANCH:-gki-android12-5.10}"
-SUSFS_REPO="${SUSFS_REPO:-https://github.com/simonpunk/susfs4ksu}"
+# 注意：susfs4ksu 的官方仓库在 GitLab，不是 GitHub。
+# 用 GitHub 地址会被当成「私有库」而要求输入用户名密码，CI 无终端即崩溃
+# （典型报错：fatal: could not read Username for 'https://github.com'）。
+# 这里保留一系列候选源，逐个探测，任一可用即采用。
+SUSFS_REPO="${SUSFS_REPO:-}"
+SUSFS_FALLBACK_REPOS="
+https://gitlab.com/simonpunk/susfs4ksu
+https://github.com/co2kernel/co2kernel_susfs
+https://github.com/2025DeveloperTeamInStaff/susfs4ksu
+"
 JOBS="${JOBS:-$(nproc)}"
 KSU_REPO="${KSU_REPO:-}"                                     # custom 时用（显式设置可覆盖 flavor 映射）
 
@@ -231,12 +240,45 @@ do_susfs() {
 
   log "SUSFS: 分支=$SUSFS_BRANCH  KSU源码=$KSU_SRC"
 
-  # --- 下载 susfs4ksu ---
+  # --- 下载 susfs4ksu：按候选源逐个探测，第一个成功即用 ---
   local SUSFS_DIR="$COMMON/.susfs4ksu"
   rm -rf "$SUSFS_DIR"
-  if ! git clone --depth=1 -b "$SUSFS_BRANCH" "$SUSFS_REPO" "$SUSFS_DIR"; then
-    err "susfs4ksu 克隆失败：仓库=$SUSFS_REPO 分支=$SUSFS_BRANCH（分支名是否与内核版本匹配？）"
-  fi
+
+  # 组装候选列表：显式指定的排最前，其后是内置备选
+  local CANDIDATES="$SUSFS_REPO $SUSFS_FALLBACK_REPOS"
+  local REPO="" OK=0 LASTERR=""
+
+  for REPO in $CANDIDATES; do
+    [ -n "$REPO" ] || continue
+    log "SUSFS: 探测 $REPO (分支 $SUSFS_BRANCH)"
+
+    # 禁用终端交互，避免 GitHub 弹用户名/密码提示把 CI 卡死
+    if ! GIT_TERMINAL_PROMPT=0 git ls-remote --exit-code --heads \
+         "$REPO" "refs/heads/$SUSFS_BRANCH" >/dev/null 2>/tmp/susfs_probe.log; then
+      LASTERR="$(tail -3 /tmp/susfs_probe.log | tr '\n' ' ')"
+      warn "  不可用：$REPO — $LASTERR"
+      continue
+    fi
+
+    log "  分支存在，开始克隆"
+    if GIT_TERMINAL_PROMPT=0 git clone --depth=1 -b "$SUSFS_BRANCH" \
+         "$REPO" "$SUSFS_DIR" 2>/tmp/susfs_clone.log; then
+      OK=1
+      log "SUSFS: 使用源 $REPO"
+      break
+    fi
+    LASTERR="$(tail -3 /tmp/susfs_clone.log | tr '\n' ' ')"
+    warn "  克隆失败：$REPO — $LASTERR"
+    rm -rf "$SUSFS_DIR"
+  done
+
+  [ "$OK" = "1" ] || err "所有 susfs4ksu 源均不可用（分支=$SUSFS_BRANCH）。
+  最后错误：$LASTERR
+  排查方向：
+    1) 分支名是否与内核版本匹配（5.10 树用 gki-android12-5.10）
+    2) 所有候选源是否都不可达（可临时自建镜像后用 SUSFS_REPO 指定）"
+
+  SUSFS_REPO="$REPO"
 
   # --- 1) 拷贝 susfs 源码文件 ---
   [ -d "$SUSFS_DIR/kernel_patches/fs" ] || err "susfs4ksu 缺少 kernel_patches/fs"
