@@ -16,13 +16,28 @@ set -e
 trap 'rc=$?; echo -e "\033[1;31m[-] 脚本失败: 第 ${LINENO} 行, exit=$rc, 命令: ${BASH_COMMAND}\033[0m"; exit $rc' ERR
 
 # ---------------- 可配置变量 ----------------
+# KSU_FLAVOR: 选择要集成的 KernelSU 分支。
+#   kowsu    = KOWX712/KernelSU      (KowSU,    管理器 com.kowx712.supermanager)
+#   apkesu   = fixz232/ApkeSU        (ApkeSU,   基于官方+SukiSU-Ultra)
+#   sukisu   = SukiSU-Ultra/SukiSU-Ultra
+#   next     = KernelSU-Next/KernelSU-Next
+#   official = tiann/KernelSU
+#   custom   = 完全用 KSU_REPO / KSU_REF 自定义
+KSU_FLAVOR="${KSU_FLAVOR:-kowsu}"
 KMI_BRANCH="${KMI_BRANCH:-common-android12-5.10}"
-KSU_REF="${KSU_REF:-main}"                                   # KowSU 分支/tag
+KSU_REF="${KSU_REF:-main}"                                   # 分支/tag
 ZTC_REPO="${ZTC_REPO:-https://github.com/ztc1997/android_gki_kernel_5.10_common}"
 ZTC_BRANCH="${ZTC_BRANCH:-}"                                 # 留空=默认分支
 KERNEL_COMPRESS="${KERNEL_COMPRESS:-gz}"                     # gz | lz4 | none
 ENABLE_KSU="${ENABLE_KSU:-y}"                                # y=built-in, m=LKM模块
+# SUSFS（内核级隐藏）开关与分支。分支需与内核版本对应：
+#   5.10  -> gki-android12-5.10     5.15 -> gki-android13-5.15
+#   6.1   -> gki-android14-6.1      6.6  -> gki-android15-6.6
+ENABLE_SUSFS="${ENABLE_SUSFS:-0}"                            # 1=启用
+SUSFS_BRANCH="${SUSFS_BRANCH:-gki-android12-5.10}"
+SUSFS_REPO="${SUSFS_REPO:-https://github.com/simonpunk/susfs4ksu}"
 JOBS="${JOBS:-$(nproc)}"
+KSU_REPO="${KSU_REPO:-}"                                     # custom 时用（显式设置可覆盖 flavor 映射）
 
 WORKDIR="$(pwd)"
 TREE="$WORKDIR/gki"
@@ -32,6 +47,22 @@ OUTDIR="$WORKDIR/out"
 log()  { echo -e "\033[1;32m[+] $*\033[0m"; }
 warn() { echo -e "\033[1;33m[!] $*\033[0m"; }
 err()  { echo -e "\033[1;31m[-] $*\033[0m"; exit 1; }
+
+# flavor -> 仓库地址映射（放在函数定义之后，才能调用 err）
+case "$KSU_FLAVOR" in
+  kowsu)    : "${KSU_REPO:=https://github.com/KOWX712/KernelSU}" ;;
+  apkesu)   : "${KSU_REPO:=https://github.com/fixz232/ApkeSU}" ;;
+  sukisu)   : "${KSU_REPO:=https://github.com/SukiSU-Ultra/SukiSU-Ultra}" ;;
+  next)     : "${KSU_REPO:=https://github.com/KernelSU-Next/KernelSU-Next}" ;;
+  official) : "${KSU_REPO:=https://github.com/tiann/KernelSU}" ;;
+  # none: 不集成任何 KernelSU，只出「纯净内核」。
+  # 用途：YukiSU 等仅支持 LKM(CONFIG_KSU=m) 的分支，需要先用干净内核铺路，
+  #       再由管理器加载官方预编译的 kernelsu.ko（内置 KSU 优先级更高，会屏蔽 LKM）。
+  resukisu) : "${KSU_REPO:=https://github.com/ReSukiSU/ReSukiSU}" ;;
+  none)     KSU_REPO="" ;;
+  custom)   if [ -z "$KSU_REPO" ]; then err "flavor=custom 时必须设置 KSU_REPO"; fi ;;
+  *)        err "未知 flavor: $KSU_FLAVOR（可选: kowsu/apkesu/sukisu/next/official/none/custom）" ;;
+esac
 
 # ---------------- 1. 同步 GKI manifest 树 ----------------
 do_sync() {
@@ -79,11 +110,15 @@ do_replace_common() {
   log "内核源码就绪: $(cd "$COMMON" && git log -1 --format='%h %s' 2>/dev/null || echo unknown)"
 }
 
-# ---------------- 3. 集成 KowSU ----------------
+# ---------------- 3. 集成 KernelSU 分支 ----------------
 do_ksu() {
   cd "$COMMON"
+  local REPO_PATH="${KSU_REPO#https://github.com/}"
+  REPO_PATH="${REPO_PATH%/}"
+  log "flavor=$KSU_FLAVOR  仓库=${REPO_PATH:-<无>}  分支=$KSU_REF"
 
   # --- 3.1 清理可能已内置的官方 KernelSU（ZTC 源码常见） ---
+  # 无论选哪个 flavor 都要先清场，否则内置 KSU 会屏蔽后续加载的 LKM。
   if [ -e drivers/kernelsu ] && [ ! -L drivers/kernelsu ]; then
     warn "检测到内置 KernelSU 目录，清理以避免冲突"
     rm -rf drivers/kernelsu
@@ -91,11 +126,43 @@ do_ksu() {
   sed -i '/kernelsu/d' drivers/Makefile
   sed -i '/kernelsu\/Kconfig/d' drivers/Kconfig
 
-  # --- 3.2 跑 KowSU setup.sh ---
-  log "集成 KowSU ($KSU_REF)"
-  curl -LSs "https://raw.githubusercontent.com/KOWX712/KernelSU/main/kernel/setup.sh" | bash -s "$KSU_REF"
+  # --- 3.1b 纯净内核模式：清完就收工，不走后面的集成 ---
+  if [ "$KSU_FLAVOR" = "none" ]; then
+    # 顺带把 defconfig 里可能残留的 KSU 配置去掉，确保内核真的「无 root」
+    local DC
+    for DC in "$COMMON"/arch/arm64/configs/*defconfig; do
+      [ -f "$DC" ] || continue
+      sed -i -E '/^CONFIG_KSU[=_]/d' "$DC"
+    done
+    log "纯净内核模式：已移除内置 KSU 与 CONFIG_KSU，不集成任何 KernelSU"
+    log "  → 刷入后请自行用管理器加载 LKM（如 YukiSU 官方预编译 kernelsu.ko）"
+    return 0
+  fi
 
-  [ -e drivers/kernelsu ] || err "KowSU 集成失败，未生成 drivers/kernelsu"
+  # --- 3.2 定位 setup.sh（依次尝试 指定分支 -> main -> master） ---
+  local SETUP_URL="" SETUP_BR="" cand tried="" url
+  for cand in "$KSU_REF" main master; do
+    [ -n "$cand" ] || continue
+    case " $tried " in *" $cand "*) continue;; esac
+    tried="$tried $cand"
+    url="https://raw.githubusercontent.com/$REPO_PATH/$cand/kernel/setup.sh"
+    log "尝试下载 setup.sh: $cand"
+    if curl -fsSL --max-time 60 "$url" -o "$COMMON/.ksu_setup.sh" 2>/dev/null; then
+      SETUP_URL="$url"; SETUP_BR="$cand"; break
+    fi
+  done
+
+  [ -n "$SETUP_URL" ] || err "在 $REPO_PATH 的 [$ tried ] 分支下都没找到 kernel/setup.sh。
+  请检查：
+    1) 仓库地址是否正确（当前 KSU_REPO=$KSU_REPO）
+    2) 分支名是否存在（当前 KSU_REF=$KSU_REF，可试 main / master）
+    3) 该仓库是否包含 kernel/ 目录（有些分支只有管理器代码，没有内核侧）"
+
+  log "已获取 setup.sh (分支 $SETUP_BR)"
+  bash "$COMMON/.ksu_setup.sh" "$KSU_REF"
+  rm -f "$COMMON/.ksu_setup.sh"
+
+  [ -e drivers/kernelsu ] || err "集成失败，未生成 drivers/kernelsu"
   log "已软链接 $(readlink drivers/kernelsu)"
 
   # --- 3.3 defconfig ---
@@ -104,23 +171,112 @@ do_ksu() {
   [ -f "$DEFCONFIG" ] || DEFCONFIG="$(ls "$COMMON"/arch/arm64/configs/*defconfig 2>/dev/null | head -1)"
   [ -f "$DEFCONFIG" ] || err "找不到 defconfig"
 
-  grep -q "CONFIG_KSU=" "$DEFCONFIG" || cat >> "$DEFCONFIG" <<EOF
+  # 逐项补齐：setup.sh 可能已写入部分配置，这里只补缺的、并校正 CONFIG_KSU 的值，
+  # 避免"已有 CONFIG_KSU 就整段跳过"导致 kprobe 相关项缺失。
+  local kv key
+  for kv in "CONFIG_KSU=$ENABLE_KSU" \
+            "CONFIG_KPROBES=y" \
+            "CONFIG_HAVE_KPROBES=y" \
+            "CONFIG_KPROBE_EVENTS=y" \
+            "CONFIG_KALLSYMS=y" \
+            "CONFIG_KALLSYMS_ALL=y"; do
+    key="${kv%%=*}"
+    if grep -qE "^${key}=" "$DEFCONFIG"; then
+      # 已存在则校正取值（只对 CONFIG_KSU 强制对齐构建方式）
+      if [ "$key" = "CONFIG_KSU" ]; then
+        sed -i "s|^${key}=.*|${kv}|" "$DEFCONFIG"
+      fi
+    else
+      echo "$kv" >> "$DEFCONFIG"
+      log "  追加 $kv"
+    fi
+  done
 
-# KernelSU (KowSU)
-CONFIG_KSU=$ENABLE_KSU
-CONFIG_KPROBES=y
-CONFIG_HAVE_KPROBES=y
-CONFIG_KPROBE_EVENTS=y
-CONFIG_KALLSYMS=y
-CONFIG_KALLSYMS_ALL=y
-EOF
-  log "已写入 $DEFCONFIG"
+  # --- 3.3b SUSFS 相关 defconfig（仅在 ENABLE_SUSFS=1 时） ---
+  # ReSukiSU 官方集成文档要求：CONFIG_KSU=y + CONFIG_KSU_SUSFS=y
+  if [ "$ENABLE_SUSFS" = "1" ]; then
+    grep -q '^CONFIG_KSU_SUSFS=' "$DEFCONFIG" \
+      || echo 'CONFIG_KSU_SUSFS=y' >> "$DEFCONFIG"
+    log "  追加 CONFIG_KSU_SUSFS=y"
+  fi
+  log "defconfig 就绪: $DEFCONFIG"
 
   # --- 3.4 版本号兜底（防止回落 16 导致管理器报版本过低） ---
   if [ -f drivers/kernelsu/Makefile ]; then
     grep -q "KSU_VERSION" drivers/kernelsu/Makefile \
       || echo 'ccflags-y += -DKSU_VERSION=30000' >> drivers/kernelsu/Makefile
   fi
+}
+
+# ---------------- 3.5 集成 SUSFS（内核级隐藏） ----------------
+# 流程依据 susfs4ksu 官方 README：
+#   1) 拷 fs/susfs.c + include/linux/susfs*.h 到内核源码
+#   2) 打内核侧补丁 50_add_susfs_in_<ver>.patch（进 common/）
+#   3) 打 KernelSU 侧补丁 10_enable_susfs_for_ksu.patch（进 KSU 源码目录）
+# 注意：分支自带 SUSFS 时（如 SukiSU-Ultra builtin）第 3 步会自动跳过。
+do_susfs() {
+  [ "$ENABLE_SUSFS" = "1" ] || { log "SUSFS: 未启用，跳过"; return 0; }
+
+  cd "$COMMON"
+
+  # --- 定位 KernelSU 源码根目录（setup.sh 通常软链接 drivers/kernelsu -> ../<KSU>/kernel） ---
+  local KSU_SRC=""
+  if [ -L drivers/kernelsu ]; then
+    KSU_SRC="$(cd "$(dirname "$(readlink -f drivers/kernelsu)")/.." && pwd)"
+  fi
+  if [ -z "$KSU_SRC" ] && [ -d "$COMMON/KernelSU" ]; then
+    KSU_SRC="$COMMON/KernelSU"
+  fi
+  [ -n "$KSU_SRC" ] || err "找不到 KernelSU 源码目录，无法打 SUSFS 补丁"
+
+  log "SUSFS: 分支=$SUSFS_BRANCH  KSU源码=$KSU_SRC"
+
+  # --- 下载 susfs4ksu ---
+  local SUSFS_DIR="$COMMON/.susfs4ksu"
+  rm -rf "$SUSFS_DIR"
+  if ! git clone --depth=1 -b "$SUSFS_BRANCH" "$SUSFS_REPO" "$SUSFS_DIR"; then
+    err "susfs4ksu 克隆失败：仓库=$SUSFS_REPO 分支=$SUSFS_BRANCH（分支名是否与内核版本匹配？）"
+  fi
+
+  # --- 1) 拷贝 susfs 源码文件 ---
+  [ -d "$SUSFS_DIR/kernel_patches/fs" ] || err "susfs4ksu 缺少 kernel_patches/fs"
+  cp -f "$SUSFS_DIR"/kernel_patches/fs/* "$COMMON/fs/" 2>/dev/null || true
+  cp -f "$SUSFS_DIR"/kernel_patches/include/linux/* "$COMMON/include/linux/" 2>/dev/null || true
+  log "SUSFS: 已拷贝 fs/ 与 include/linux/ 下的 susfs 文件"
+
+  # --- 2) 内核侧补丁（进 common/） ---
+  local KPATCH
+  KPATCH=$(ls "$SUSFS_DIR"/kernel_patches/50_add_susfs_in_*.patch 2>/dev/null | head -1)
+  [ -n "$KPATCH" ] || err "未找到 50_add_susfs_in_*.patch"
+
+  cd "$COMMON"
+  if patch -p1 --forward --no-backup-if-mismatch -i "$KPATCH" > /tmp/susfs_k.log 2>&1; then
+    log "SUSFS: 内核侧补丁已应用 $(basename "$KPATCH")"
+  elif grep -qE 'Reversed|previously applied|already exists' /tmp/susfs_k.log; then
+    warn "SUSFS: 内核侧补丁似已应用，跳过"
+  else
+    warn "SUSFS 内核侧补丁应用异常，日志尾部："; tail -20 /tmp/susfs_k.log
+    err "SUSFS 内核侧补丁失败（详见上方日志）"
+  fi
+
+  # --- 3) KernelSU 侧补丁（进 KSU 源码目录） ---
+  local SPATCH="$SUSFS_DIR/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
+  if [ ! -f "$SPATCH" ]; then
+    warn "SUSFS: 未找到 KSU 侧补丁，跳过（该分支可能已内置 SUSFS）"
+  else
+    cd "$KSU_SRC"
+    if patch -p1 --forward --no-backup-if-mismatch -i "$SPATCH" > /tmp/susfs_s.log 2>&1; then
+      log "SUSFS: KSU 侧补丁已应用"
+    elif grep -qE 'Reversed|previously applied' /tmp/susfs_s.log; then
+      warn "SUSFS: KSU 侧补丁似已应用，跳过"
+    else
+      warn "SUSFS: KSU 侧补丁失败，尝试 git apply --3way"
+      git apply --3way "$SPATCH" 2>&1 | tail -20 || warn "SUSFS: KSU 侧补丁最终未应用（内核可能仍可编译，但 SUSFS 功能或不完整）"
+    fi
+  fi
+
+  rm -rf "$SUSFS_DIR"
+  log "SUSFS 集成步骤结束"
 }
 
 # ---------------- 4. 绕过 GKI 构建校验 ----------------
@@ -274,10 +430,13 @@ do_pack() {
   cp -f "$WORKDIR/anykernel.sh" "$WORKDIR/ak3/anykernel.sh"
   cp -f "$KIMG" "$WORKDIR/ak3/"
 
-  sed -i "s|kernel.string=.*|kernel.string=K50-KowSU GKI $(date +%Y%m%d)|" "$WORKDIR/ak3/anykernel.sh"
+  # 命名带上 flavor 与 SUSFS 标记，避免多个包下载后分不清
+  local SUF=""
+  [ "$ENABLE_SUSFS" = "1" ] && SUF="-susfs"
+  sed -i "s|kernel.string=.*|kernel.string=K50-${KSU_FLAVOR}${SUF} GKI $(date +%Y%m%d)|" "$WORKDIR/ak3/anykernel.sh"
 
   cd "$WORKDIR/ak3"
-  local ZIPNAME="K50-KowSU-android12-5.10-$(date +%Y%m%d-%H%M).zip"
+  local ZIPNAME="K50-${KSU_FLAVOR}${SUF}-android12-5.10-$(date +%Y%m%d-%H%M).zip"
   zip -r9 "$WORKDIR/out/$ZIPNAME" ./* -x .git .gitignore README.md
   log "刷机包: out/$ZIPNAME"
 }
@@ -287,6 +446,7 @@ case "${1:-all}" in
   sync)    do_sync ;;
   replace) do_replace_common ;;
   ksu)     do_ksu ;;
+  susfs)   do_susfs ;;
   patch)   do_patch_build ;;
   kernel)  do_kernel ;;
   pack)    do_pack ;;
@@ -294,10 +454,11 @@ case "${1:-all}" in
     do_sync
     do_replace_common
     do_ksu
+    do_susfs
     do_patch_build
     do_kernel
     do_pack
     log "全部完成，产物在 out/"
     ;;
-  *) echo "用法: $0 [all|sync|replace|ksu|patch|kernel|pack]" ; exit 1 ;;
+  *) echo "用法: $0 [all|sync|replace|ksu|susfs|patch|kernel|pack]" ; exit 1 ;;
 esac
